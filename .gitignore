@@ -1,0 +1,20 @@
+# 빌드 산출물
+/bin/
+/ratelimitd
+*.exe
+*.test
+*.out
+
+# 테스트 커버리지
+coverage.txt
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
