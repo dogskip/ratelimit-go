@@ -1,6 +1,7 @@
 package ratelimit
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -94,5 +95,27 @@ func TestMultiKey_Peek(t *testing.T) {
 	}
 	if r.Remaining > 2.1 || r.Remaining < 1.9 {
 		t.Fatalf("remaining = %f, want ~2", r.Remaining)
+	}
+}
+
+func TestMultiKey_ConcurrentDifferentKeys(t *testing.T) {
+	now := time.Now()
+	mk := NewMultiKey(func() (Limiter, error) {
+		return NewTokenBucket(100, 10, now)
+	}, 1000)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			key := fmt.Sprintf("k-%d", n%10)
+			mk.Take(key, now, 1)
+		}(i)
+	}
+	wg.Wait()
+	// 10개 키만 생성되어야.
+	if mk.Size() > 10 {
+		t.Fatalf("size = %d, want <= 10", mk.Size())
 	}
 }
