@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # 주 1회 보안 스캔 (월요일 09:00 UTC).
+    - cron: '0 9 * * 1'
 
 jobs:
   test:
@@ -28,3 +31,16 @@ jobs:
         run: go test -race -count=1 ./...
       - name: Build
         run: go build ./...
+
+  security-scan:
+    runs-on: ubuntu-latest
+    # govulncheck로 알려진 취약점이 있는 표준 라이브러리/의존성 스캔.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Run govulncheck
+        run: govulncheck ./...
