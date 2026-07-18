@@ -137,13 +137,28 @@ type MemoryBackend struct {
 	// sync.Map은 *mbEntry을 값으로 갖는다. 포인터로 감싸는 이유는
 	// LoadOrStore이 복사를 피하고, 생성 후에도 lastUse를 갱신하기 위함.
 	entries sync.Map
+
+	// 운영 통계 카운터. atomic로 락 없이 갱신.
+	takeCalls   atomic.Int64
+	allowed     atomic.Int64
+	denied      atomic.Int64
+	peekCalls   atomic.Int64
+	resetCalls  atomic.Int64
+	keysCreated atomic.Int64
+	keysEvicted atomic.Int64
+
+	// statsMu는 레거시 Stats() 호환을 위한 것으로, 실제 카운터는
+	// 위 atomic 필드들로 관리된다. 향후 Stats() 제거 시 제거 가능.
+	statsMu sync.RWMutex
 }
 
 // mbEntry은 키별 리미터를 담는다.
-// lastUse 같은 메타데이터는 현재 쓰지 않는다. 향후 LRU 증발이 필요해지면
-// atomic.Int64로 나노초를 저장해 레이스 없이 갱신할 수 있다.
+// lastUseNanos/createdNanos는 atomic로 갱신해 레이스 없이 유휴 판단이 가능.
+// SweepIdleKeys가 이 값으로 오래된 키를 회수한다.
 type mbEntry struct {
-	limiter Limiter
+	limiter      Limiter
+	lastUseNanos int64 // 마지막 Take/Peek/Reset 시각 (유닉스 나노초)
+	createdNanos int64 // 생성 시각
 }
 
 // NewMemoryBackend는 기본 time.Now를 쓰는 메모리 백엔드를 만든다.
@@ -190,6 +205,7 @@ func (b *MemoryBackend) newLimiter(now time.Time) (Limiter, error) {
 
 // getOrCreate은 키에 대한 리미터를 가져오거나 새로 만든다.
 // LoadOrStore로 인해 동시 생성 시 하나만 살아남는다.
+// 새로 생성된 경우 keysCreated 카운터를 증가시킨다.
 func (b *MemoryBackend) getOrCreate(key string, now time.Time) (Limiter, error) {
 	if v, ok := b.entries.Load(key); ok {
 		return v.(*mbEntry).limiter, nil
@@ -198,13 +214,25 @@ func (b *MemoryBackend) getOrCreate(key string, now time.Time) (Limiter, error) 
 	if err != nil {
 		return nil, err
 	}
-	entry := &mbEntry{limiter: lim}
+	nowNanos := now.UnixNano()
+	entry := &mbEntry{
+		limiter:      lim,
+		createdNanos: nowNanos,
+		lastUseNanos: nowNanos,
+	}
 	// 다른 고루틴이 먼저 저장했을 수 있으니 LoadOrStore로 확인.
 	// actual이 기존 것이면 그걸 쓰고, 새 것이면 그대로 둔다.
 	if actual, loaded := b.entries.LoadOrStore(key, entry); loaded {
 		return actual.(*mbEntry).limiter, nil
 	}
+	b.keysCreated.Add(1)
 	return lim, nil
+}
+
+// touchEntry은 entry의 lastUseNanos를 현재 시각으로 갱신한다.
+// atomic 스토어로 레이스 없이 갱신한다.
+func (b *MemoryBackend) touchEntry(e *mbEntry, now time.Time) {
+	atomic.StoreInt64(&e.lastUseNanos, now.UnixNano())
 }
 
 // Take는 key에 대해 cost만큼의 예산을 소비한다.
@@ -242,6 +270,18 @@ func (b *MemoryBackend) Take(ctx context.Context, key string, cost float64) (Res
 	if err != nil {
 		return Result{}, err
 	}
+	// 통계 갱신: Take 호출 수와 허용/거부.
+	b.takeCalls.Add(1)
+	if r.Allowed {
+		b.allowed.Add(1)
+	} else {
+		b.denied.Add(1)
+	}
+	// lastUse 갱신은 리미터 호출 후에. 실패해도 touch는 의미 있다
+	// (시도 자체가 활동이므로).
+	if e, ok := b.entries.Load(key); ok {
+		b.touchEntry(e.(*mbEntry), now)
+	}
 	return r, nil
 }
 
@@ -257,6 +297,10 @@ func (b *MemoryBackend) Peek(ctx context.Context, key string) Result {
 	lim, err := b.getOrCreate(key, now)
 	if err != nil {
 		return Result{}
+	}
+	b.peekCalls.Add(1)
+	if e, ok := b.entries.Load(key); ok {
+		b.touchEntry(e.(*mbEntry), now)
 	}
 	return lim.Peek(now)
 }
@@ -279,6 +323,8 @@ func (b *MemoryBackend) Reset(ctx context.Context, key string) error {
 	}
 	e := v.(*mbEntry)
 	e.limiter.Reset(now)
+	b.resetCalls.Add(1)
+	b.touchEntry(e, now)
 	return nil
 }
 
